@@ -1,0 +1,6 @@
+job-scraper-automation/
+├── .github/
+│   └── workflows/
+│       └── daily.yml          ← GitHub Actions workflow
+├── main.py                    ← Python script (provided earlier)
+├── README.md                  ← Optional, for notes
