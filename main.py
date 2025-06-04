@@ -1,70 +1,78 @@
+import os
 import requests
 from bs4 import BeautifulSoup
-import gspread
+from gspread import authorize
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import os
 import telegram
 
 # --- Config ---
+SHEET_NAME = "JobScraper"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SHEET_NAME = "JobScraper"  # Name of your Google Sheet tab
+LI_AT_COOKIE = os.getenv("LI_AT_COOKIE")  # Add this secret in GitHub
 
-# --- Setup Google Sheets ---
+# --- Google Sheets Auth ---
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
-client = gspread.authorize(creds)
-sheet = client.open(SHEET_NAME).sheet1  # Use the first sheet
+client = authorize(creds)
+sheet = client.open(SHEET_NAME).sheet1
 
-# --- Setup Telegram Bot ---
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
-
-# --- LinkedIn Scraper ---
-def scrape_linkedin():
-    base_url = "https://www.linkedin.com/jobs/search"
-    params = {
-        "keywords": "Research Associate OR Analyst",
-        "location": "India",
-        "trk": "public_jobs_jobs-search-bar_search-submit",
-        "f_TPR": "r86400",  # Posted in past 24 hours
+# --- LinkedIn Scraper (with cookies and separate keyword searches) ---
+def scrape_linkedin_jobs():
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Cookie": f"li_at={LI_AT_COOKIE}"
     }
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(base_url, headers=headers, params=params)
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    keywords = ["Research Associate", "Analyst"]
     jobs = []
-    for li in soup.find_all("li", class_="result-card"):
-        try:
-            title = li.find("h3").text.strip()
-            company = li.find("h4").text.strip()
-            location = li.find("span", class_="job-result-card__location").text.strip()
-            job_link = li.find("a", class_="result-card__full-card-link")["href"]
-            easy_apply = "Easy Apply" in li.text
-            jobs.append([datetime.now().isoformat(), title, company, location, job_link, "Yes" if easy_apply else "No"])
-        except:
-            continue
+
+    for keyword in keywords:
+        search_url = (
+            "https://www.linkedin.com/jobs/search"
+            f"?keywords={keyword.replace(' ', '%20')}&location=India&f_TPR=r86400"
+        )
+        res = requests.get(search_url, headers=headers)
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        for job_card in soup.find_all("li"):
+            title = job_card.find("h3")
+            if not title:
+                continue
+            title = title.text.strip()
+            company = job_card.find("h4").text.strip() if job_card.find("h4") else "Unknown"
+            location = job_card.find("span", class_="job-result-card__location")
+            location = location.text.strip() if location else "Unknown"
+            job_url = job_card.find("a")["href"]
+
+            jobs.append({
+                "title": title,
+                "company": company,
+                "location": location,
+                "url": job_url
+            })
+
     return jobs
 
-# --- Main Flow ---
-def main():
-    jobs = scrape_linkedin()
-    if not jobs:
-        print("No jobs found.")
-        return
-
-    # Header row (only if empty)
-    if not sheet.get_all_values():
-        sheet.append_row(["Date", "Title", "Company", "Location", "Link", "Easy Apply"])
-
+# --- Push to Google Sheet ---
+def push_to_google_sheet(jobs):
+    existing_urls = sheet.col_values(4)
     for job in jobs:
-        sheet.append_row(job)
+        if job["url"] not in existing_urls:
+            sheet.append_row([job["title"], job["company"], job["location"], job["url"]])
 
-    # Telegram summary
-    message = f"📌 Found {len(jobs)} new jobs:\n\n"
-    for job in jobs[:5]:  # Limit to top 5 in message
-        message += f"🧾 {job[1]} at {job[2]} ({job[3]})\n🔗 {job[4]}\n\n"
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+# --- Send Telegram Alerts ---
+def send_telegram_alerts(jobs):
+    bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    for job in jobs:
+        msg = f"📌 *{job['title']}*\n🏢 {job['company']}\n📍 {job['location']}\n🔗 {job['url']}"
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
 
+# --- Main ---
 if __name__ == "__main__":
-    main()
+    jobs = scrape_linkedin_jobs()
+    if jobs:
+        push_to_google_sheet(jobs)
+        send_telegram_alerts(jobs)
+    else:
+        print("No jobs found.")
